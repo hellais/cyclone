@@ -1401,7 +1401,9 @@ class Application(protocol.ServerFactory):
         self.protocol.no_multipart = self.settings.get("no_multipart", False)
         self.protocol.form_urlencoded_maximum_size = \
             self.settings.get("form_urlencoded_maximum_size", None)
-
+        self.protocol.get_content_buffer = \
+            self.settings.get("get_content_buffer",
+                              self.protocol.get_content_buffer)
 
     def add_handlers(self, host_pattern, host_handlers):
         """Appends the given handlers to our handler list.

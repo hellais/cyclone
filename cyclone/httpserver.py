@@ -34,6 +34,7 @@ from __future__ import absolute_import, division, with_statement
 import Cookie
 import socket
 import time
+from cgi import parse_header
 
 from io import BytesIO as StringIO
 from tempfile import TemporaryFile
@@ -107,7 +108,10 @@ class HTTPConnection(basic.LineReceiver):
         self._contentbuffer.write(data)
         if self.content_length == 0:
             self._contentbuffer.seek(0, 0)
-            self._on_request_body(self._contentbuffer)
+            if self.content_disposition is not None:
+                self._on_request_body(self._contentbuffer)
+            else:
+                self._on_request_body(self._contentbuffer.read())
             self.content_length = self._contentbuffer = None
             self.setLineMode(rest)
 
@@ -145,6 +149,20 @@ class HTTPConnection(basic.LineReceiver):
         if disconnect is True:
             self.transport.loseConnection()
 
+    def _on_content_disposition(self, content_disposition):
+        d_type, d_params = parse_header(content_disposition)
+        if d_type != 'attachment' or 'filename' not in d_params:
+            raise _BadRequestException("Malformed Content-Disposition header")
+        self._request.files.setdefault(d_params['filename'], []).append(
+            httputil.HTTPFile(
+                filename=d_params['filename'],
+                body=self._contentbuffer,
+                length=int(self.content_length),
+                content_type=self._request.headers.get("Content-Type",
+                                                       "application/octet-stream")
+            )
+        )
+
     def _on_headers(self, data):
         try:
             data = native_str(data.decode("latin1"))
@@ -164,11 +182,17 @@ class HTTPConnection(basic.LineReceiver):
                 headers=headers, remote_ip=self._remote_ip)
 
             self.content_length = int(headers.get("Content-Length", 0))
+            self.content_disposition = self._request.headers.get(
+                "Content-Disposition", None
+            )
+
             if self.content_length:
                 if headers.get("Expect") == "100-continue":
                     self.transport.write("HTTP/1.1 100 (Continue)\r\n\r\n")
 
                 self._contentbuffer = self.get_content_buffer(headers)
+                if self.content_disposition is not None:
+                    self._on_content_disposition(self.content_disposition)
                 self.setRawMode()
                 return
 
@@ -211,9 +235,9 @@ class HTTPConnection(basic.LineReceiver):
         else:
             log.msg("Invalid multipart/form-data")
 
-    def _on_request_body(self, data_buffer):
+    def _on_request_body(self, data):
         try:
-            self._request.body = data_buffer
+            self._request.body = data
             content_type = self._request.headers.get("Content-Type", "")
             if self._request.method in ("POST", "PATCH", "PUT"):
                 if content_type.startswith("application/x-www-form-urlencoded"):
