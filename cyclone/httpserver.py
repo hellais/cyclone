@@ -65,6 +65,8 @@ class HTTPConnection(basic.LineReceiver):
     load balancer.
     """
     delimiter = "\r\n"
+    no_multipart = False
+    form_urlencoded_maximum_size = None
 
     def connectionMade(self):
         self._headersbuffer = []
@@ -105,7 +107,7 @@ class HTTPConnection(basic.LineReceiver):
         self._contentbuffer.write(data)
         if self.content_length == 0:
             self._contentbuffer.seek(0, 0)
-            self._on_request_body(self._contentbuffer.read())
+            self._on_request_body(self._contentbuffer)
             self.content_length = self._contentbuffer = None
             self.setLineMode(rest)
 
@@ -154,27 +156,19 @@ class HTTPConnection(basic.LineReceiver):
                 raise _BadRequestException("Malformed HTTP request line")
             if not version.startswith("HTTP/"):
                 raise _BadRequestException(
-                    "Malformed HTTP version in HTTP Request-Line")
-            try:
-                headers = httputil.HTTPHeaders.parse(data[eol:])
-                content_length = int(headers.get("Content-Length", 0))
-            except ValueError:
-                raise _BadRequestException(
-                    "Malformed HTTP headers")
+                    "Malformed HTTP version in HTTP Request-Line"
+                )
+            headers = httputil.HTTPHeaders.parse(data[eol:])
             self._request = HTTPRequest(
                 connection=self, method=method, uri=uri, version=version,
                 headers=headers, remote_ip=self._remote_ip)
 
-            if content_length:
+            self.content_length = int(headers.get("Content-Length", 0))
+            if self.content_length:
                 if headers.get("Expect") == "100-continue":
                     self.transport.write("HTTP/1.1 100 (Continue)\r\n\r\n")
 
-                if content_length < 100000:
-                    self._contentbuffer = StringIO()
-                else:
-                    self._contentbuffer = TemporaryFile()
-
-                self.content_length = content_length
+                self._contentbuffer = self.get_content_buffer(headers)
                 self.setRawMode()
                 return
 
@@ -183,30 +177,59 @@ class HTTPConnection(basic.LineReceiver):
             log.msg("Malformed HTTP request from %s: %s", self._remote_ip, e)
             self.transport.loseConnection()
 
-    def _on_request_body(self, data):
-        self._request.body = data
-        content_type = self._request.headers.get("Content-Type", "")
-        if self._request.method in ("POST", "PATCH", "PUT"):
-            if content_type.startswith("application/x-www-form-urlencoded"):
-                arguments = parse_qs_bytes(native_str(self._request.body))
-                for name, values in arguments.iteritems():
-                    values = [v for v in values if v]
-                    if values:
-                        self._request.arguments.setdefault(name,
-                                                           []).extend(values)
-            elif content_type.startswith("multipart/form-data"):
-                fields = content_type.split(";")
-                for field in fields:
-                    k, sep, v, = field.strip().partition("=")
-                    if k == "boundary" and v:
-                        httputil.parse_multipart_form_data(
-                            utf8(v), data,
-                            self._request.arguments,
-                            self._request.files)
-                        break
-                else:
-                    log.msg("Invalid multipart/form-data")
-        self.request_callback(self._request)
+    def get_content_buffer(self, headers):
+        if self.content_length < 100000:
+            return StringIO()
+        return TemporaryFile()
+
+    def _on_www_form_urlencoded(self):
+        if self.form_urlencoded_maximum_size is not None \
+                and self.content_length > self.form_urlencoded_maximum_size:
+            raise _BadRequestException("Maximum content length for"
+                                       " www-form-urlencoded"
+                                       " requests reached.")
+        arguments = parse_qs_bytes(native_str(self._request.body))
+        for name, values in arguments.iteritems():
+            values = [v for v in values if v]
+            if values:
+                self._request.arguments.setdefault(name, []).extend(values)
+
+    def _on_multipart(self, content_type, data_buffer):
+        if self.no_multipart:
+            raise _BadRequestException(
+                "Content type multipart/form-data not supported."
+            )
+        fields = content_type.split(";")
+        for field in fields:
+            k, sep, v, = field.strip().partition("=")
+            if k == "boundary" and v:
+                httputil.parse_multipart_form_data(
+                    utf8(v), data_buffer.read(),
+                    self._request.arguments,
+                    self._request.files)
+                break
+        else:
+            log.msg("Invalid multipart/form-data")
+
+    def _on_request_body(self, data_buffer):
+        try:
+            self._request.body = data_buffer
+            content_type = self._request.headers.get("Content-Type", "")
+            if self._request.method in ("POST", "PATCH", "PUT"):
+                if content_type.startswith("application/x-www-form-urlencoded"):
+                    self._on_www_form_urlencoded()
+                elif content_type.startswith("multipart/form-data"):
+                    self._on_multipart(content_type, data_buffer)
+            self.request_callback(self._request)
+        except Exception as exception:
+            log.msg(
+                "Malformed HTTP request from %s: %s" % (self._remote_ip,
+                                                        exception)
+            )
+            if self._request:
+                self._request.finish()
+            if self.transport:
+                self.transport.loseConnection()
 
     @property
     def _remote_ip(self):
