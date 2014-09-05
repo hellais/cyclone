@@ -43,6 +43,7 @@ from twisted.protocols import basic
 from twisted.internet import address
 from twisted.internet import defer
 from twisted.internet import interfaces
+from twisted.web.http import parseContentRange
 
 from cyclone.escape import utf8, native_str, parse_qs_bytes
 from cyclone import httputil
@@ -79,6 +80,7 @@ class HTTPConnection(basic.LineReceiver):
         self.xheaders = self.factory.settings.get('xheaders', False)
         self._request = None
         self._request_finished = False
+        self._file = None
 
     def connectionLost(self, reason):
         if self._finish_callback:
@@ -153,14 +155,28 @@ class HTTPConnection(basic.LineReceiver):
         d_type, d_params = parse_header(content_disposition)
         if d_type != 'attachment' or 'filename' not in d_params:
             raise _BadRequestException("Malformed Content-Disposition header")
-        self._request.files.setdefault(d_params['filename'], []).append(
-            httputil.HTTPFile(
+        if self._file:
+            self._contentbuffer = self._file.body
+        else:
+            if self.content_range:
+                length = int(self.content_range[2] - 1)
+            else:
+                length = self.content_length
+            self._file = httputil.HTTPFile(
                 filename=d_params['filename'],
                 body=self._contentbuffer,
-                length=int(self.content_length),
+                length=length,
                 content_type=self._request.headers.get("Content-Type",
-                                                       "application/octet-stream")
+                                                    "application/octet-stream"),
+                finished=False
             )
+        if self.content_range:
+            if int(self.content_range[1]) == (int(self.content_range[2]) - 1):
+                self._file.finished = True
+        else:
+            self._file.finished = True
+        self._request.files.setdefault(d_params['filename'], []).append(
+            self._file
         )
 
     def _on_headers(self, data):
@@ -185,6 +201,9 @@ class HTTPConnection(basic.LineReceiver):
             self.content_disposition = self._request.headers.get(
                 "Content-Disposition", None
             )
+            self.content_range = headers.get("Content-Range", None)
+            if self.content_range:
+                self.content_range = parseContentRange(self.content_range)
 
             if self.content_length:
                 if headers.get("Expect") == "100-continue":
@@ -218,7 +237,9 @@ class HTTPConnection(basic.LineReceiver):
             if values:
                 self._request.arguments.setdefault(name, []).extend(values)
 
-    def _on_multipart(self, content_type, data_buffer):
+    def _on_multipart(self, content_type, data):
+        if self.content_disposition is not None:
+            data = data.read()
         if self.no_multipart:
             raise _BadRequestException(
                 "Content type multipart/form-data not supported."
@@ -228,7 +249,7 @@ class HTTPConnection(basic.LineReceiver):
             k, sep, v, = field.strip().partition("=")
             if k == "boundary" and v:
                 httputil.parse_multipart_form_data(
-                    utf8(v), data_buffer.read(),
+                    utf8(v), data,
                     self._request.arguments,
                     self._request.files)
                 break
@@ -243,7 +264,7 @@ class HTTPConnection(basic.LineReceiver):
                 if content_type.startswith("application/x-www-form-urlencoded"):
                     self._on_www_form_urlencoded()
                 elif content_type.startswith("multipart/form-data"):
-                    self._on_multipart(content_type, data_buffer)
+                    self._on_multipart(content_type, data)
             self.request_callback(self._request)
         except Exception as exception:
             log.msg(
