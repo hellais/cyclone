@@ -237,6 +237,7 @@ class HTTPConnectionTest(unittest.TestCase):
 
     def test_on_request_body_post_multipart_form_data(self):
         self.con.request_callback = Mock()
+        self.con.connectionMade()
         self.con._request = Mock()
         self.con._request.arguments = {}
         self.con._request.method = "POST"
