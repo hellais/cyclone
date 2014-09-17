@@ -76,6 +76,7 @@ class HTTPConnection(basic.LineReceiver):
         self._finish_callback = None
         self.no_keep_alive = False
         self.content_length = None
+        self.content_disposition = None
         self.request_callback = self.factory
         self.xheaders = self.factory.settings.get('xheaders', False)
         self._request = None
